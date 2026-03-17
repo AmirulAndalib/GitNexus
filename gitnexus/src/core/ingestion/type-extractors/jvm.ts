@@ -287,7 +287,10 @@ const extractKotlinDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: M
   }
 };
 
-/** Kotlin: formal_parameter → type name */
+/** Kotlin: parameter / formal_parameter → type name.
+ *  Kotlin's tree-sitter grammar uses positional children (simple_identifier, user_type)
+ *  rather than named fields (name, type) on `parameter` nodes, so we fall back to
+ *  findChildByType when childForFieldName returns null. */
 const extractKotlinParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string, string>): void => {
   let nameNode: SyntaxNode | null = null;
   let typeNode: SyntaxNode | null = null;
@@ -299,6 +302,10 @@ const extractKotlinParameter: ParameterExtractor = (node: SyntaxNode, env: Map<s
     nameNode = node.childForFieldName('name') ?? node.childForFieldName('pattern');
     typeNode = node.childForFieldName('type');
   }
+
+  // Fallback: Kotlin `parameter` nodes use positional children, not named fields
+  if (!nameNode) nameNode = findChildByType(node, 'simple_identifier');
+  if (!typeNode) typeNode = findChildByType(node, 'user_type');
 
   if (!nameNode || !typeNode) return;
   const varName = extractVarName(nameNode);
@@ -444,6 +451,7 @@ const extractKotlinForLoopBinding: ForLoopExtractor = (
   // The iterable is the second named child of the for_statement (after variable_declaration)
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let fallbackIterableName: string | undefined;
   let foundVarDecl = false;
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -458,15 +466,14 @@ const extractKotlinForLoopBinding: ForLoopExtractor = (
       const obj = child.firstNamedChild;
       const suffix = findChildByType(child, 'navigation_suffix');
       const prop = suffix ? findChildByType(suffix, 'simple_identifier') : null;
-      // If the suffix has a call_suffix, it's a method call on a container (e.g., data.keys()).
-      // Otherwise it's a bare property access (e.g., self.users) — use the property as iterableName.
       const hasCallSuffix = suffix ? findChildByType(suffix, 'call_suffix') !== null : false;
-      if (hasCallSuffix || !prop) {
-        if (obj?.type === 'simple_identifier') iterableName = obj.text;
-        if (prop) methodName = prop.text;
-      } else {
-        // Bare property access: self.users, repo.users → use property as iterable name
-        iterableName = prop.text;
+      // Always try object as iterable + property as method first (handles data.values, data.keys).
+      // For bare property access without call_suffix, also save property as fallback
+      // (handles this.users, repo.items where the property IS the iterable).
+      if (obj?.type === 'simple_identifier') iterableName = obj.text;
+      if (prop) methodName = prop.text;
+      if (!hasCallSuffix && prop) {
+        fallbackIterableName = prop.text;
       }
       break;
     }
@@ -487,7 +494,14 @@ const extractKotlinForLoopBinding: ForLoopExtractor = (
   }
   if (!iterableName) return;
 
-  const containerTypeName = scopeEnv.get(iterableName);
+  let containerTypeName = scopeEnv.get(iterableName);
+  // Fallback: if object has no type in scope, try the property as the iterable name.
+  // Handles patterns like this.users where the property itself is the iterable variable.
+  if (!containerTypeName && fallbackIterableName) {
+    iterableName = fallbackIterableName;
+    methodName = undefined;
+    containerTypeName = scopeEnv.get(iterableName);
+  }
   const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
   const elementType = resolveIterableElementType(
     iterableName, node, scopeEnv, declarationTypeNodes, scope,

@@ -3240,6 +3240,32 @@ fun process() {
     });
   });
 
+  describe('Kotlin for-loop HashMap.values resolution (Phase 6)', () => {
+    it('for (user in data.values) binds user to User via HashMap<String, User>', () => {
+      const tree = parse(`
+fun processValues(data: HashMap<String, User>) {
+    for (user in data.values) {
+        user.save()
+    }
+}
+      `, Kotlin);
+      const { env } = buildTypeEnv(tree, 'kotlin');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('for (user in users) binds user to User via List<User> param', () => {
+      const tree = parse(`
+fun processList(users: List<User>) {
+    for (user in users) {
+        user.save()
+    }
+}
+      `, Kotlin);
+      const { env } = buildTypeEnv(tree, 'kotlin');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+  });
+
   describe('Java switch pattern variable (Phase 6)', () => {
     it('switch (obj) { case User u -> } binds u to User', () => {
       const tree = parse(`

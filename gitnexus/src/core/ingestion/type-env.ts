@@ -48,11 +48,42 @@ export interface TypeEnvironment {
   readonly env: TypeEnv;
 }
 
+/**
+ * Position-indexed pattern binding: active only within a specific AST range.
+ * Used for smart-cast narrowing in mutually exclusive branches (e.g., Kotlin when arms).
+ */
+interface PatternOverride {
+  rangeStart: number;
+  rangeEnd: number;
+  typeName: string;
+}
+
+/** scope → varName → overrides (checked in order, first range match wins) */
+type PatternOverrides = Map<string, Map<string, PatternOverride[]>>;
+
+/** AST node types that represent mutually exclusive branch containers for pattern bindings. */
+const PATTERN_BRANCH_TYPES = new Set([
+  'when_entry',          // Kotlin when
+  'switch_block_label',  // Java switch (enhanced)
+]);
+
+/** Walk up the AST from a pattern node to find the enclosing branch container. */
+const findPatternBranchScope = (node: SyntaxNode): SyntaxNode | undefined => {
+  let current = node.parent;
+  while (current) {
+    if (PATTERN_BRANCH_TYPES.has(current.type)) return current;
+    if (FUNCTION_NODE_TYPES.has(current.type)) return undefined;
+    current = current.parent;
+  }
+  return undefined;
+};
+
 /** Implementation of the lookup logic — shared between TypeEnvironment and the legacy export. */
 const lookupInEnv = (
   env: TypeEnv,
   varName: string,
   callNode: SyntaxNode,
+  patternOverrides?: PatternOverrides,
 ): string | undefined => {
   // Self/this receiver: resolve to enclosing class name via AST walk
   if (varName === 'self' || varName === 'this' || varName === '$this') {
@@ -67,6 +98,20 @@ const lookupInEnv = (
 
   // Determine the enclosing function scope for the call
   const scopeKey = findEnclosingScopeKey(callNode);
+
+  // Check position-indexed pattern overrides first (e.g., Kotlin when/is smart casts).
+  // These take priority over flat scopeEnv because they represent per-branch narrowing.
+  if (scopeKey && patternOverrides) {
+    const varOverrides = patternOverrides.get(scopeKey)?.get(varName);
+    if (varOverrides) {
+      const pos = callNode.startIndex;
+      for (const override of varOverrides) {
+        if (pos >= override.rangeStart && pos <= override.rangeEnd) {
+          return stripNullable(override.typeName);
+        }
+      }
+    }
+  }
 
   // Try function-local scope first
   if (scopeKey) {
@@ -289,6 +334,7 @@ export const buildTypeEnv = (
   symbolTable?: SymbolTable,
 ): TypeEnvironment => {
   const env: TypeEnv = new Map();
+  const patternOverrides: PatternOverrides = new Map();
   const localClassNames = new Set<string>();
   const classNames = createClassNameLookup(localClassNames, symbolTable);
   const config = typeConfigs[language];
@@ -319,7 +365,9 @@ export const buildTypeEnv = (
     if (TYPED_PARAMETER_TYPES.has(node.type)) {
       // Capture the raw type annotation BEFORE extractParameter.
       // Most languages use 'name' field; Rust uses 'pattern'; TS uses 'pattern' for some param types.
-      const typeNode = node.childForFieldName('type');
+      // Kotlin `parameter` nodes use positional children instead of named fields,
+      // so we fall back to scanning children by type when childForFieldName returns null.
+      let typeNode = node.childForFieldName('type');
       if (typeNode) {
         const nameNode = node.childForFieldName('name')
           ?? node.childForFieldName('pattern');
@@ -327,6 +375,27 @@ export const buildTypeEnv = (
           const varName = extractVarName(nameNode);
           if (varName && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
             declarationTypeNodes.set(`${scope}\0${varName}`, typeNode);
+          }
+        }
+      } else {
+        // Fallback: positional children (Kotlin `parameter` → simple_identifier + user_type)
+        let fallbackName: SyntaxNode | null = null;
+        let fallbackType: SyntaxNode | null = null;
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (!child) continue;
+          if (!fallbackName && (child.type === 'simple_identifier' || child.type === 'identifier')) {
+            fallbackName = child;
+          }
+          if (!fallbackType && (child.type === 'user_type' || child.type === 'type_identifier'
+            || child.type === 'generic_type' || child.type === 'parameterized_type')) {
+            fallbackType = child;
+          }
+        }
+        if (fallbackName && fallbackType) {
+          const varName = extractVarName(fallbackName);
+          if (varName && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
+            declarationTypeNodes.set(`${scope}\0${varName}`, fallbackType);
           }
         }
       }
@@ -409,9 +478,29 @@ export const buildTypeEnv = (
     // Conservative: extractor returns undefined when source type is unknown.
     if (config.extractPatternBinding && (!config.patternBindingNodeTypes || config.patternBindingNodeTypes.has(node.type))) {
       const patternBinding = config.extractPatternBinding(node, scopeEnv, declarationTypeNodes, scope);
-      // Allow overwrite for languages with smart-cast narrowing (e.g., Kotlin when)
-      if (patternBinding && (!scopeEnv.has(patternBinding.varName) || config.allowPatternBindingOverwrite)) {
-        scopeEnv.set(patternBinding.varName, patternBinding.typeName);
+      if (patternBinding) {
+        if (config.allowPatternBindingOverwrite) {
+          // Position-indexed: store per-branch binding for smart-cast narrowing.
+          // Each when arm / switch case gets its own type for the variable,
+          // preventing cross-arm contamination (e.g., Kotlin when/is).
+          const branchNode = findPatternBranchScope(node);
+          if (branchNode) {
+            if (!patternOverrides.has(scope)) patternOverrides.set(scope, new Map());
+            const varMap = patternOverrides.get(scope)!;
+            if (!varMap.has(patternBinding.varName)) varMap.set(patternBinding.varName, []);
+            varMap.get(patternBinding.varName)!.push({
+              rangeStart: branchNode.startIndex,
+              rangeEnd: branchNode.endIndex,
+              typeName: patternBinding.typeName,
+            });
+          }
+          // Also store in flat scopeEnv as fallback (last arm wins — same as before
+          // for code that doesn't use position-indexed lookup).
+          scopeEnv.set(patternBinding.varName, patternBinding.typeName);
+        } else if (!scopeEnv.has(patternBinding.varName)) {
+          // First-writer-wins for languages without smart-cast overwrite (Java instanceof, etc.)
+          scopeEnv.set(patternBinding.varName, patternBinding.typeName);
+        }
       }
     }
 
@@ -459,7 +548,7 @@ export const buildTypeEnv = (
   }
 
   return {
-    lookup: (varName, callNode) => lookupInEnv(env, varName, callNode),
+    lookup: (varName, callNode) => lookupInEnv(env, varName, callNode, patternOverrides),
     constructorBindings: bindings,
     env,
   };
